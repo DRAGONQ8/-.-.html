@@ -12,9 +12,11 @@ Install Python Playwright and Chromium for the browser tests. Set `CHROMIUM` if 
 
 ```sh
 python tests/test_image_runtime.py ZIP_Launcher_V4_Fixed.html
+python tests/test_save_launcher.py
 ```
 
 The controlled browser suite creates temporary ZIP fixtures and an instrumented copy of the launcher to control message timing. The Seen Jeem integration test uses the unmodified artifact.
+The save test downloads the launcher twice, checks that live project content is not included, and opens a ZIP and its image in the saved launcher while offline.
 
 For integration, create a ZIP of Seen Jeem commit `ba408fad868df4996caa7efb8552a88ae367f75c` with prefix `S.V.html-main/`, then run:
 

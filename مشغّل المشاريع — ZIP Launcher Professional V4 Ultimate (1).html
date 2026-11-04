@@ -1885,8 +1885,10 @@ body.immersive-active .fs-floating-bar {
         <p class="drop-desc">اسحب ملف ZIP أو ملف HTML إلى هنا، وسيقوم المحرك الذكي بفحص الأمان وتحديد أفضل نقطة تشغيل تلقائياً.</p>
         <div class="import-btn-row">
           <button type="button" class="btn lg" id="pickZipBtn">فتح ملف ZIP / HTML</button>
+          <button type="button" class="btn secondary lg" id="saveLauncherHtmlBtn">حفظ المشغّل كملف HTML</button>
           <button type="button" class="btn secondary lg hidden" id="openLastSiteHomeBtn">فتح آخر موقع</button>
         </div>
+        <span class="recent-meta">يحفظ الزر نسخة من المشغّل فقط؛ المواقع المحفوظة تبقى في مكتبة المتصفح.</span>
         <span class="recent-meta">ملاحظة: استيراد ملف .html منفرد يشغّل محتواه المدمج مباشرة ولا يمنح صلاحية قراءة الملفات المجاورة خارج الأرشيف.</span>
         <input type="file" id="zipFileInput" class="file-input-hidden" accept=".zip,.html,.htm,application/zip,application/x-zip-compressed,text/html">
       </div>
@@ -1980,6 +1982,7 @@ body.immersive-active .fs-floating-bar {
             <button type="button" class="dropdown-item" id="menuLibraryBtn"><span>مكتبة المواقع</span><span>📚</span></button>
             <button type="button" class="dropdown-item" id="menuSaveLibBtn"><span>حفظ/تحديث في المكتبة</span><span>💾</span></button>
             <button type="button" class="dropdown-item" id="menuExportZipBtn"><span>تصدير الأرشيف (ZIP)</span><span>⬇</span></button>
+            <button type="button" class="dropdown-item" id="menuSaveLauncherHtmlBtn"><span>حفظ المشغّل كملف HTML</span><span>⬇</span></button>
             <div class="dropdown-divider"></div>
             <button type="button" class="dropdown-item" id="menuFreeMemBtn"><span>تحرير الذاكرة المؤقتة</span><span>🧹</span></button>
             <button type="button" class="dropdown-item" id="menuChangeZipBtn"><span>فتح ملف جديد (ZIP / HTML)</span><span>📁</span></button>
@@ -2072,6 +2075,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 <script>
 (() => {
 'use strict';
+
+// Capture the complete launcher before application state or project content changes the DOM.
+// This also works when the launcher is opened locally without a network connection.
+const standaloneLauncherHtml = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
 
 const $ = id => document.getElementById(id);
 
@@ -2334,6 +2341,25 @@ function setStatus(msg, level = 'info') {
   el.textContent = msg;
   el.className = 'status-bar' + (level === 'err' ? ' err' : level === 'ok' ? ' ok' : level === 'warn' ? ' warn' : '');
 }
+
+function saveLauncherHtml() {
+  try {
+    const url = URL.createObjectURL(new Blob([standaloneLauncherHtml], { type: 'text/html;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'ZIP_Launcher_V4_Fixed.html';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 15000);
+    showToast('تم بدء تنزيل المشغّل كملف HTML');
+  } catch (err) {
+    setStatus('تعذّر حفظ المشغّل: ' + (err?.message || String(err)), 'err');
+  }
+}
+
+$('saveLauncherHtmlBtn').addEventListener('click', saveLauncherHtml);
+$('menuSaveLauncherHtmlBtn').addEventListener('click', saveLauncherHtml);
 
 function setProgress(pctVal, label) {
   const card = $('progressCard');
