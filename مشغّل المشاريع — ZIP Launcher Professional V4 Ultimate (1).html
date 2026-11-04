@@ -2161,7 +2161,7 @@ const state = {
   ambiguousLowerKeys: new Set(),
   blobs: new Map(),               // path -> Blob
   blobByteSize: 0,
-  inFlightExtractions: new Map(), // "projectId|path" -> Promise<Blob|null>
+  inFlightExtractions: new Map(), // archive map -> generation/path -> Promise<Blob|null>
   textCache: new Map(),           // path -> string
   previewUrls: [],
   activeFrameUrls: [],
@@ -2951,7 +2951,6 @@ async function extractBlobShared(path, customContext = null) {
   if (!path) return null;
   const targetBlobs = customContext ? customContext.blobs : state.blobs;
   const targetMap = customContext ? customContext.map : state.map;
-  const targetPid = customContext ? customContext.projectId : (state.projectId || state.fingerprint);
 
   if (targetBlobs && targetBlobs.has(path)) return targetBlobs.get(path);
   const f = targetMap ? targetMap.get(path) : null;
@@ -2963,14 +2962,18 @@ async function extractBlobShared(path, customContext = null) {
     return f.directBlob;
   }
 
-  const flightKey = `${targetPid}|${path}`;
-  if (state.inFlightExtractions.has(flightKey)) {
-    return state.inFlightExtractions.get(flightKey);
-  }
-
   const currentOpSeq = state.operationSeq;
+  // A navigation can invalidate a pending extraction without changing the project ID.
+  // A saved child window can also hold a different archive map for the same ID.
+  let flights = state.inFlightExtractions.get(targetMap);
+  if (!flights) {
+    flights = new Map();
+    state.inFlightExtractions.set(targetMap, flights);
+  }
+  const flightKey = `${customContext ? 'snapshot' : `operation:${currentOpSeq}`}|${path}`;
+  if (flights.has(flightKey)) return flights.get(flightKey);
+
   const promise = (async () => {
-    try {
       const u8 = await f.entry.async('uint8array');
       if (!customContext && state.operationSeq !== currentOpSeq) return null;
       const expectedSize = Number(f.size ?? f.entry?._data?.uncompressedSize ?? 0);
@@ -2986,7 +2989,9 @@ async function extractBlobShared(path, customContext = null) {
           ext(path) === 'html' || ext(path) === 'js',
           'preflight'
         );
-        throw new Error(`تلف بيانات الملف داخل الأرشيف (${path}): عدم تطابق الطول.`);
+        const error = new Error(`تلف بيانات الملف داخل الأرشيف (${path}): عدم تطابق الطول.`);
+        error.code = 'ZIP_DECOMPRESSION_FAILED';
+        throw error;
       }
       const rawCrc = f.entry?._data?.crc32;
       if (typeof rawCrc === 'number') {
@@ -3004,23 +3009,36 @@ async function extractBlobShared(path, customContext = null) {
             ext(path) === 'html' || ext(path) === 'js',
             'preflight'
           );
-          throw new Error(`فشل فحص سلامة البيانات CRC32 للملف (${path}).`);
+          const error = new Error(`فشل فحص سلامة البيانات CRC32 للملف (${path}).`);
+          error.code = 'CRC32_MISMATCH';
+          throw error;
         }
       }
       const m = MIME_MAP[ext(path)] || 'application/octet-stream';
-      const blob = new Blob([u8], { type: m });
+      let blob;
+      try {
+        blob = new Blob([u8], { type: m });
+      } catch (cause) {
+        const error = new Error(`Blob creation failed for "${path}": ${cause?.message || String(cause)}`);
+        error.code = 'BLOB_CREATION_FAILED';
+        throw error;
+      }
       if (!customContext) {
         cacheBlobWithMemoryGuard(path, blob);
       } else if (targetBlobs && blob.size <= ARCHIVE_POLICY.maxSingleEagerFileBytes) {
         targetBlobs.set(path, blob);
       }
       return blob;
-    } finally {
-      state.inFlightExtractions.delete(flightKey);
-    }
   })();
 
-  state.inFlightExtractions.set(flightKey, promise);
+  flights.set(flightKey, promise);
+  const clearFlight = () => {
+    if (flights.get(flightKey) === promise) flights.delete(flightKey);
+    if (!flights.size && state.inFlightExtractions.get(targetMap) === flights) {
+      state.inFlightExtractions.delete(targetMap);
+    }
+  };
+  promise.then(clearFlight, clearFlight);
   return promise;
 }
 
@@ -4610,7 +4628,7 @@ function iframeVirtualRuntimeBootstrap(cfg) {
         return;
       }
       const tag = ev.target.tagName.toLowerCase();
-      const rawRef = ev.target.getAttribute?.('data-vfs-orig') || ev.target.getAttribute?.('src') || ev.target.getAttribute?.('href') || '';
+      const rawRef = ev.target.getAttribute?.('data-vfs-orig') || ev.target.getAttribute?.('data-vfs-orig-srcset') || ev.target.getAttribute?.('src') || ev.target.getAttribute?.('href') || '';
       if (rawRef && !rawRef.startsWith('blob:') && !rawRef.startsWith('data:')) {
         const isCritical = tag === 'script' || tag === 'link';
         reportDiag(isCritical ? 'error' : 'warn', `فشل تحميل مورد <${tag}>`, rawRef, `تعذّر تحميل المورد (${rawRef}) داخل الصفحة.`, 'تحقق من وجود الملف وصحة مساره النسبي داخل الأرشيف.', `Element <${tag}> resource load error for "${rawRef}"`, isCritical);
@@ -4821,7 +4839,7 @@ function iframeVirtualRuntimeBootstrap(cfg) {
           if (onDemandInFlightByPath.get(p) === current) {
             onDemandInFlightByPath.delete(p);
           }
-          current.resolve(null);
+          current.resolve(null, { code: 'REQUEST_TIMEOUT', message: `Timed out loading "${p}".` });
         }
       }, 25000);
 
@@ -4830,7 +4848,7 @@ function iframeVirtualRuntimeBootstrap(cfg) {
         path: p,
         promise: sharedPromise,
         timer,
-        resolve: (blob) => {
+        resolve: (blob, error = null) => {
           clearTimeout(timer);
           onDemandInFlightByReqId.delete(reqId);
           if (onDemandInFlightByPath.get(p) === entry) {
@@ -4838,6 +4856,12 @@ function iframeVirtualRuntimeBootstrap(cfg) {
           }
           if (blob && window.__VFS_BLOBS__ && !runtimeDisposed) {
             window.__VFS_BLOBS__.set(p, blob);
+          }
+          if (error && !runtimeDisposed) {
+            const code = String(error.code || 'ZIP_DECOMPRESSION_FAILED');
+            const detail = String(error.message || 'Resource extraction failed.');
+            reportDiag('error', 'فشل استخراج المورد (' + code + ')', p,
+              `تعذّر تحميل المورد (${p}): ${detail}`, '', `${code}: ${detail}`);
           }
           resolveShared(blob || null);
         }
@@ -5536,6 +5560,34 @@ function iframeVirtualRuntimeBootstrap(cfg) {
 
   const origSetAttr = Element.prototype.setAttribute;
   const origGetAttr = Element.prototype.getAttribute;
+  const origRemoveAttr = Element.prototype.removeAttribute;
+  const styleVersions = new WeakMap();
+  function nextStyleVersion(style, property = '') {
+    let versions = styleVersions.get(style);
+    if (!versions) {
+      versions = { all: 0, groups: new Map() };
+      styleVersions.set(style, versions);
+    }
+    const name = String(property).toLowerCase();
+    const group = name.startsWith('background') ? 'background' : name;
+    if (!group) {
+      versions.all++;
+      return { versions, all: versions.all, group: '', value: 0 };
+    }
+    const value = (versions.groups.get(group) || 0) + 1;
+    versions.groups.set(group, value);
+    return { versions, all: versions.all, group, value };
+  }
+  function isCurrentStyleVersion(ticket) {
+    return ticket.versions.all === ticket.all &&
+      (!ticket.group || ticket.versions.groups.get(ticket.group) === ticket.value);
+  }
+
+  function invalidateResourceAttr(el, attrName) {
+    origRemoveAttr.call(el, 'data-vfs-orig-' + String(attrName).toLowerCase());
+    if (String(attrName).toLowerCase() !== 'srcset') origRemoveAttr.call(el, 'data-vfs-orig');
+    origRemoveAttr.call(el, 'data-vfs-loading');
+  }
 
   function bindElementResourceAttr(el, attrName, rawVal, nativeSetter) {
     if (!rawVal || typeof rawVal !== 'string') return false;
@@ -5547,6 +5599,7 @@ function iframeVirtualRuntimeBootstrap(cfg) {
     if (!p) return false;
 
     origSetAttr.call(el, 'data-vfs-orig', rawVal);
+    origSetAttr.call(el, 'data-vfs-orig-' + attrName.toLowerCase(), rawVal);
     const u = getBlobUrl(p, hash);
     if (u) {
       el.removeAttribute('data-vfs-loading');
@@ -5561,7 +5614,7 @@ function iframeVirtualRuntimeBootstrap(cfg) {
       origSetAttr.call(el, 'data-vfs-loading', p);
       requestOnDemandBlob(p).then(b => {
         if (runtimeDisposed) return;
-        if (el.getAttribute('data-vfs-orig') !== rawVal) return;
+        if (el.getAttribute('data-vfs-orig-' + attrName.toLowerCase()) !== rawVal) return;
         el.removeAttribute('data-vfs-loading');
         if (b) {
           const blobUrl = getBlobUrl(p, hash);
@@ -5570,8 +5623,6 @@ function iframeVirtualRuntimeBootstrap(cfg) {
           if (el.tagName === 'SOURCE' && el.parentElement && typeof el.parentElement.load === 'function') {
             try { el.parentElement.load(); } catch (e) {}
           }
-        } else {
-          reportDiag('error', `فشل تحميل مورد <${el.tagName.toLowerCase()}>`, p, `تعذّر استخراج المورد (${rawVal}) عند الطلب.`, '', `On-demand extraction returned null for "${p}"`);
         }
       });
       return true;
@@ -5602,7 +5653,7 @@ function iframeVirtualRuntimeBootstrap(cfg) {
   }
 
   function bindElementSrcset(el, rawSet) {
-    if (!rawSet || rawSet.includes('blob:')) return false;
+    if (!rawSet) return false;
     origSetAttr.call(el, 'data-vfs-orig-srcset', rawSet);
     const items = splitSrcsetCandidates(rawSet);
     if (items.length === 0) return false;
@@ -5623,7 +5674,7 @@ function iframeVirtualRuntimeBootstrap(cfg) {
     });
     if (!needsAsync) {
       const joined = syncParts.join(', ');
-      if (joined !== rawSet) origSetAttr.call(el, 'srcset', joined);
+      origSetAttr.call(el, 'srcset', joined);
       return true;
     }
     origSetAttr.call(el, 'data-vfs-loading', 'srcset');
@@ -5658,6 +5709,7 @@ function iframeVirtualRuntimeBootstrap(cfg) {
             return;
           }
         }
+        invalidateResourceAttr(this, propName);
         return desc.set.call(this, val);
       },
       configurable: true
@@ -5674,14 +5726,30 @@ function iframeVirtualRuntimeBootstrap(cfg) {
   patchSrcProp(window.HTMLIFrameElement, 'src');
   patchSrcProp(window.HTMLObjectElement, 'data');
 
+  for (const Proto of [window.HTMLImageElement, window.HTMLSourceElement]) {
+    if (!Proto) continue;
+    const desc = Object.getOwnPropertyDescriptor(Proto.prototype, 'srcset');
+    if (!desc || !desc.set) continue;
+    Object.defineProperty(Proto.prototype, 'srcset', {
+      get() { return desc.get.call(this); },
+      set(val) {
+        if (typeof val === 'string' && bindElementSrcset(this, val)) return;
+        invalidateResourceAttr(this, 'srcset');
+        return desc.set.call(this, val);
+      },
+      configurable: true
+    });
+  }
+
   try {
     const styleSetProp = CSSStyleDeclaration.prototype.setProperty;
     CSSStyleDeclaration.prototype.setProperty = function(prop, val, priority) {
-      if (typeof val === 'string' && val.includes('url(') && !val.includes('blob:') && !val.includes('data:')) {
+      const version = nextStyleVersion(this, prop);
+      if (typeof val === 'string' && val.includes('url(')) {
         const syncVal = rewriteCssInlineSync(val, pagePath);
         const res = styleSetProp.call(this, prop, syncVal, priority);
         rewriteCssAsync(val, pagePath).then(asyncVal => {
-          if (asyncVal !== syncVal && !runtimeDisposed) {
+          if (asyncVal !== syncVal && !runtimeDisposed && isCurrentStyleVersion(version)) {
             try { styleSetProp.call(this, prop, asyncVal, priority); } catch (e) {}
           }
         });
@@ -5689,17 +5757,26 @@ function iframeVirtualRuntimeBootstrap(cfg) {
       }
       return styleSetProp.call(this, prop, val, priority);
     };
+    const styleRemoveProp = CSSStyleDeclaration.prototype.removeProperty;
+    CSSStyleDeclaration.prototype.removeProperty = function(prop) {
+      nextStyleVersion(this, prop);
+      return styleRemoveProp.call(this, prop);
+    };
     for (const cssProp of ['backgroundImage', 'background']) {
-      const d = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, cssProp);
+      // Chromium exposes these setters on CSS2Properties, not CSSStyleDeclaration.
+      let owner = Object.getPrototypeOf(document.documentElement.style);
+      while (owner && !Object.getOwnPropertyDescriptor(owner, cssProp)) owner = Object.getPrototypeOf(owner);
+      const d = owner && Object.getOwnPropertyDescriptor(owner, cssProp);
       if (d && d.set) {
-        Object.defineProperty(CSSStyleDeclaration.prototype, cssProp, {
+        Object.defineProperty(owner, cssProp, {
           get() { return d.get.call(this); },
           set(val) {
-            if (typeof val === 'string' && val.includes('url(') && !val.includes('blob:') && !val.includes('data:')) {
+            const version = nextStyleVersion(this, cssProp);
+            if (typeof val === 'string' && val.includes('url(')) {
               const syncVal = rewriteCssInlineSync(val, pagePath);
               d.set.call(this, syncVal);
               rewriteCssAsync(val, pagePath).then(asyncVal => {
-                if (asyncVal !== syncVal && !runtimeDisposed) {
+                if (asyncVal !== syncVal && !runtimeDisposed && isCurrentStyleVersion(version)) {
                   try { d.set.call(this, asyncVal); } catch (e) {}
                 }
               });
@@ -5710,6 +5787,29 @@ function iframeVirtualRuntimeBootstrap(cfg) {
           configurable: true
         });
       }
+    }
+    const cssTextDesc = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, 'cssText');
+    if (cssTextDesc && cssTextDesc.set) {
+      Object.defineProperty(CSSStyleDeclaration.prototype, 'cssText', {
+        get() { return cssTextDesc.get.call(this); },
+        set(val) {
+          nextStyleVersion(this);
+          if (typeof val !== 'string' || !val.includes('url(')) {
+            return cssTextDesc.set.call(this, val);
+          }
+          const syncVal = rewriteCssInlineSync(val, pagePath);
+          const result = cssTextDesc.set.call(this, syncVal);
+          rewriteCssAsync(val, pagePath).then(() => {
+            if (runtimeDisposed) return;
+            // Re-read the current declaration so unrelated later edits survive.
+            const current = cssTextDesc.get.call(this);
+            const rewritten = rewriteCssInlineSync(current, pagePath);
+            if (rewritten !== current) cssTextDesc.set.call(this, rewritten);
+          });
+          return result;
+        },
+        configurable: true
+      });
     }
   } catch (e) {}
 
@@ -5863,20 +5963,35 @@ function iframeVirtualRuntimeBootstrap(cfg) {
       if (bindElementResourceAttr(this, name, strVal, null)) {
         return;
       }
-    } else if (n === 'style' && typeof val === 'string' && val.includes('url(')) {
-      origSetAttr.call(this, 'data-vfs-orig-style', val);
-      const syncCss = rewriteCssInlineSync(val, pagePath);
-      origSetAttr.call(this, name, syncCss);
-      rewriteCssAsync(val, pagePath).then(asyncCss => {
-        if (asyncCss !== syncCss && !runtimeDisposed && this.getAttribute('data-vfs-orig-style') === val) {
-          origSetAttr.call(this, name, asyncCss);
-        }
-      });
-      return;
+      invalidateResourceAttr(this, n);
+    } else if (n === 'style') {
+      const version = nextStyleVersion(this.style);
+      if (typeof val === 'string' && val.includes('url(')) {
+        origSetAttr.call(this, 'data-vfs-orig-style', val);
+        const syncCss = rewriteCssInlineSync(val, pagePath);
+        origSetAttr.call(this, name, syncCss);
+        rewriteCssAsync(val, pagePath).then(asyncCss => {
+          if (asyncCss !== syncCss && !runtimeDisposed && isCurrentStyleVersion(version) && this.getAttribute('data-vfs-orig-style') === val) {
+            origSetAttr.call(this, name, asyncCss);
+          }
+        });
+        return;
+      }
     } else if (n === 'srcset' && typeof val === 'string') {
       if (bindElementSrcset(this, val)) return;
+      invalidateResourceAttr(this, n);
     }
     return origSetAttr.call(this, name, val);
+  };
+
+  Element.prototype.removeAttribute = function(name) {
+    const n = String(name).toLowerCase();
+    if (n === 'src' || n === 'href' || n === 'poster' || n === 'data' || n === 'srcset') {
+      invalidateResourceAttr(this, n);
+    } else if (n === 'style') {
+      nextStyleVersion(this.style);
+    }
+    return origRemoveAttr.call(this, name);
   };
 
   function patchElementTree(root) {
@@ -5917,18 +6032,19 @@ function iframeVirtualRuntimeBootstrap(cfg) {
       }
       if (el.hasAttribute('srcset')) {
         const rawSet = el.getAttribute('srcset') || '';
-        if (rawSet && !rawSet.includes('blob:')) {
+        if (rawSet) {
           bindElementSrcset(el, rawSet);
         }
       }
       if (el.hasAttribute('style')) {
         const st = el.getAttribute('style') || '';
-        if (st.includes('url(') && !st.includes('blob:') && !st.includes('data:')) {
+        if (st.includes('url(')) {
+          const version = nextStyleVersion(el.style);
           origSetAttr.call(el, 'data-vfs-orig-style', st);
           const nextSt = rewriteCssInlineSync(st, pagePath);
           if (nextSt !== st) origSetAttr.call(el, 'style', nextSt);
           rewriteCssAsync(st, pagePath).then(asyncSt => {
-            if (asyncSt !== nextSt && !runtimeDisposed && el.getAttribute('data-vfs-orig-style') === st) {
+            if (asyncSt !== nextSt && !runtimeDisposed && isCurrentStyleVersion(version) && el.getAttribute('data-vfs-orig-style') === st) {
               origSetAttr.call(el, 'style', asyncSt);
             }
           });
@@ -6166,9 +6282,11 @@ function iframeVirtualRuntimeBootstrap(cfg) {
     }
 
     if (msg.type === '__ZIP_RES_BLOB__') {
-      const pendingById = msg.reqId ? onDemandInFlightByReqId.get(msg.reqId) : null;
-      const pending = pendingById || (msg.path ? onDemandInFlightByPath.get(msg.path) : null);
-      if (pending) pending.resolve(msg.blob || null);
+      // A late response must never satisfy a newer request for the same path.
+      const pending = msg.reqId
+        ? onDemandInFlightByReqId.get(msg.reqId)
+        : (msg.path ? onDemandInFlightByPath.get(msg.path) : null);
+      if (pending && (!msg.path || msg.path === pending.path)) pending.resolve(msg.blob || null, msg.error || null);
       return;
     }
 
@@ -6343,15 +6461,18 @@ function iframeVirtualRuntimeBootstrap(cfg) {
         } else if (m.type === 'attributes' && !isInternalStylePatch && m.target && m.target.nodeType === 1) {
           const el = m.target;
           if (m.attributeName === 'style') {
+            // Some engines expose style properties as exotic own properties rather
+            // than prototype setters; the attribute observer catches those writes.
+            const version = nextStyleVersion(el.style);
             const st = origGetAttr ? (el.getAttribute('style') || '') : '';
-            if (st.includes('url(') && !st.includes('blob:') && !st.includes('data:')) {
+            if (st.includes('url(')) {
               isInternalStylePatch = true;
               origSetAttr.call(el, 'data-vfs-orig-style', st);
               const nextSt = rewriteCssInlineSync(st, pagePath);
               if (nextSt !== st) origSetAttr.call(el, 'style', nextSt);
               isInternalStylePatch = false;
               rewriteCssAsync(st, pagePath).then(asyncSt => {
-                if (asyncSt !== nextSt && !runtimeDisposed && el.getAttribute('data-vfs-orig-style') === st) {
+                if (asyncSt !== nextSt && !runtimeDisposed && isCurrentStyleVersion(version) && el.getAttribute('data-vfs-orig-style') === st) {
                   isInternalStylePatch = true;
                   origSetAttr.call(el, 'style', asyncSt);
                   isInternalStylePatch = false;
@@ -8033,12 +8154,32 @@ window.addEventListener('message', async (e) => {
     const mapRef = snap ? snap.map : state.map;
     const safePath = (!check.rejected && mapRef.has(check.safe)) ? check.safe : null;
     let blob = null;
+    let error = null;
+    if (check.rejected) {
+      error = { code: 'INVALID_RESOURCE_PATH', message: check.reason || `Invalid resource path: ${data.path}` };
+    } else if (!safePath) {
+      error = { code: 'ARCHIVE_ENTRY_MISSING', message: `Archive entry not found: ${data.path}` };
+    }
     if (safePath) {
       try {
         blob = await extractBlobShared(safePath, snap);
+        if (!blob) error = { code: 'STALE_RUNTIME', message: `Extraction became stale for "${safePath}".` };
       } catch (err) {
-        blob = null;
+        const detail = String(err?.message || err || 'Unknown extraction error');
+        const code = typeof err?.code === 'string' ? err.code
+          : /CRC32/i.test(detail) ? 'CRC32_MISMATCH'
+          : (err?.name === 'RangeError' || /out of memory|allocation failed/i.test(detail)) ? 'MEMORY_ALLOCATION_FAILED'
+          : 'ZIP_DECOMPRESSION_FAILED';
+        error = { code, message: detail };
       }
+    }
+    // The original frame may have been replaced while extraction was awaiting.
+    if (isFromViewer) {
+      if ($('viewer')?.contentWindow !== e.source || state.activeRunToken !== contextToken ||
+          (state.projectId || state.fingerprint || 'default') !== targetProjectId) return;
+    } else if (isFromChildTab) {
+      const currentChild = state.childWindowContexts.get(e.source);
+      if (!currentChild || currentChild.runToken !== contextToken || currentChild.projectId !== targetProjectId) return;
     }
     try {
       e.source.postMessage({
@@ -8046,7 +8187,8 @@ window.addEventListener('message', async (e) => {
         runToken: contextToken,
         reqId,
         path: data.path,
-        blob
+        blob,
+        error
       }, '*');
     } catch (err) {}
     return;
