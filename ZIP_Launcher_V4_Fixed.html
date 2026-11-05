@@ -4858,24 +4858,14 @@ function iframeVirtualRuntimeBootstrap(cfg) {
       const sharedPromise = new Promise((res) => {
         resolveShared = res;
       });
-      const timer = setTimeout(() => {
-        const current = onDemandInFlightByReqId.get(reqId);
-        if (current) {
-          onDemandInFlightByReqId.delete(reqId);
-          if (onDemandInFlightByPath.get(p) === current) {
-            onDemandInFlightByPath.delete(p);
-          }
-          current.resolve(null, { code: 'REQUEST_TIMEOUT', message: `Timed out loading "${p}".` });
-        }
-      }, 25000);
-
       entry = {
         reqId,
         path: p,
         promise: sharedPromise,
-        timer,
+        timer: null,
+        attempts: 0,
         resolve: (blob, error = null) => {
-          clearTimeout(timer);
+          clearTimeout(entry.timer);
           onDemandInFlightByReqId.delete(reqId);
           if (onDemandInFlightByPath.get(p) === entry) {
             onDemandInFlightByPath.delete(p);
@@ -4895,7 +4885,19 @@ function iframeVirtualRuntimeBootstrap(cfg) {
 
       onDemandInFlightByPath.set(p, entry);
       onDemandInFlightByReqId.set(reqId, entry);
-      postToHost({ type: '__ZIP_REQ_BLOB__', path: p, reqId });
+      // Re-send a request if its response is delayed or lost. Keep the same
+      // request identity so a late response can still satisfy the pending
+      // image; the host deduplicates concurrent extraction of the same path.
+      const sendRequest = () => {
+        entry.attempts++;
+        postToHost({ type: '__ZIP_REQ_BLOB__', path: p, reqId });
+        entry.timer = setTimeout(() => {
+          if (onDemandInFlightByReqId.get(reqId) !== entry) return;
+          if (entry.attempts < 3) sendRequest();
+          else entry.resolve(null, { code: 'REQUEST_TIMEOUT', message: `Timed out loading "${p}" after ${entry.attempts} attempts.` });
+        }, 25000);
+      };
+      sendRequest();
     }
 
     if (!signal) {

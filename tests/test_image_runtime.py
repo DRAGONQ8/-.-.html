@@ -59,6 +59,8 @@ class ImageRuntimeTest(unittest.TestCase):
         marker = 'function iframeVirtualRuntimeBootstrap(cfg) {'
         if source.count(marker) != 1: raise ValueError('Expected one iframe bootstrap in artifact')
         instrumented = source.replace(marker, marker + "\n          window.__holdResponses = true; window.__responses = [];\n          addEventListener('message', e => {\n            if (window.__holdResponses && e.data && e.data.type === '__ZIP_RES_BLOB__') {\n              e.stopImmediatePropagation(); window.__responses.push(e.data);\n            }\n          }, true);\n          window.__releaseResponse = (response) => { const held = window.__holdResponses; window.__holdResponses = false; try { dispatchEvent(new MessageEvent('message', {data: response, source: parent})); } finally { window.__holdResponses = held; } }; \n        ", 1)
+        # Shorten only this test's request timeout; production still uses 25s.
+        instrumented = instrumented.replace('}, 25000);', '}, window.__testRequestTimeoutMs || 25000);', 1)
         cls.instrumented = Path(cls.tmp.name) / LAUNCHER.name
         cls.instrumented.write_text(instrumented, encoding='utf-8')
         cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(QuietHandler, directory=cls.tmp.name))
@@ -118,6 +120,22 @@ class ImageRuntimeTest(unittest.TestCase):
         self.assertEqual(self.frame.locator('#target').evaluate('(i) => i.naturalWidth'), 0, 'A response with the wrong request ID was accepted')
         self.frame.locator('#fixture').evaluate("() => window.__releaseResponse(window.__responses[0])")
         self.frame.locator('#target').evaluate("i => new Promise((resolve,reject) => {let until=Date.now()+5000,t=setInterval(()=>{if(i.naturalWidth){clearInterval(t);resolve()}else if(Date.now()>until){clearInterval(t);reject(new Error('valid response did not render'))}},20)})")
+        self.assertEqual(self.frame.locator('#target').evaluate('i => i.naturalWidth'), 2)
+
+    def test_lost_response_is_retried_and_image_loads(self):
+        self.frame.locator('#fixture').evaluate("el => {window.__testRequestTimeoutMs=300; const i=new Image();i.id='target';i.src='assets/pic0.png';el.appendChild(i)}")
+        # Hold the first response to simulate a delayed or lost message. A retry
+        # must preserve the original pending image and eventually render it.
+        self.wait_responses(2)
+        self.frame.locator('#fixture').evaluate("() => window.__releaseResponse(window.__responses[1])")
+        self.frame.locator('#target').evaluate("i => new Promise((resolve,reject) => {let until=Date.now()+5000,t=setInterval(()=>{if(i.naturalWidth){clearInterval(t);resolve()}else if(Date.now()>until){clearInterval(t);reject(new Error('retry did not render image'))}},20)})")
+        self.assertEqual(self.frame.locator('#target').evaluate('i => i.naturalWidth'), 2)
+
+    def test_late_original_response_remains_valid_during_retry(self):
+        self.frame.locator('#fixture').evaluate("el => {window.__testRequestTimeoutMs=300; const i=new Image();i.id='target';i.src='assets/pic0.png';el.appendChild(i)}")
+        self.wait_responses(2)
+        self.frame.locator('#fixture').evaluate("() => window.__releaseResponse(window.__responses[0])")
+        self.frame.locator('#target').evaluate("i => new Promise((resolve,reject) => {let until=Date.now()+5000,t=setInterval(()=>{if(i.naturalWidth){clearInterval(t);resolve()}else if(Date.now()>until){clearInterval(t);reject(new Error('late response did not render image'))}},20)})")
         self.assertEqual(self.frame.locator('#target').evaluate('i => i.naturalWidth'), 2)
 
     def test_delayed_source_does_not_override_new_data_url(self):

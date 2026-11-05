@@ -8,6 +8,8 @@ reproducibly selectable; the Seen Jeem archive and its source are never modified
 """
 import argparse
 import functools
+import hashlib
+import zipfile
 import http.server
 import json
 import socketserver
@@ -27,6 +29,8 @@ def main():
     parser.add_argument('--zip', required=True)
     parser.add_argument('--offline', action='store_true', help='Disable network after launcher document load')
     parser.add_argument('--mobile', action='store_true', help='Chromium mobile emulation (not a physical device)')
+    parser.add_argument('--skip-reopen', action='store_true', help='Test image display without the resume flow')
+    parser.add_argument('--target', action='append', help='Limit to one or more question IDs')
     parser.add_argument('--screenshot-dir', default='/tmp/seen-jeem-browser')
     args = parser.parse_args()
     artifact = (ROOT / args.artifact).resolve()
@@ -38,9 +42,34 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f'http://127.0.0.1:{server.server_address[1]}/{artifact.name}'
     results=[]
+    # Derive reference bytes from the selected archive: this works with both the
+    # current game and older snapshots without requiring a pinned commit.
+    food_assets = {
+        'food_cultures_q01': 'assets/images/questions/food/sushi.webp',
+        'food_cultures_q10': 'assets/images/questions/food/koshary.webp',
+        'food_cultures_q24': 'assets/images/questions/food/harira.webp',
+        'food_cultures_q06': 'assets/images/questions/batch-food/mansaf.webp',
+    }
+    with zipfile.ZipFile(zip_path) as archive:
+        names = archive.namelist()
+        hashes = {}
+        for target, path in food_assets.items():
+            matches = [name for name in names if name == path or name.endswith('/' + path)]
+            if not matches and target == 'food_cultures_q06':
+                print(f'SKIP {target}: image absent from this older archive', flush=True)
+                continue
+            assert len(matches) == 1, (path, matches)
+            hashes[target] = hashlib.sha256(archive.read(matches[0])).hexdigest()
     with sync_playwright() as p:
         browser = p.chromium.launch(executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox'])
-        for target, category, size in [('arab_capitals_q12','arab_capitals',(960,640)),('kw_landmarks_q13','kw_landmarks',(675,900))]:
+        for target, category, size in [
+            ('arab_capitals_q12', 'arab_capitals', (960, 640)),
+            ('kw_landmarks_q13', 'kw_landmarks', (675, 900)),
+            *[(target, 'food_cultures', None) for target in food_assets if target in hashes],
+        ]:
+            if args.target and target not in args.target:
+                continue
+            print(f'Testing {target}', flush=True)
             context=browser.new_context(**(dict(p.devices['Pixel 7']) if args.mobile else {'viewport':{'width':1280,'height':900}}))
             page=context.new_page()
             page.goto(url)
@@ -54,7 +83,7 @@ def main():
             # Wait for app startup, not the original static HTML shell.
             frame.locator('#hero-total-categories').wait_for(timeout=120000)
             page.wait_for_function("document.querySelector('#statusBar').textContent.includes('قيد التشغيل')",timeout=120000)
-            page.frames[-1].wait_for_function("window.SeenJeemEngine && document.querySelector('#hero-total-categories').textContent === '207'", timeout=120000)
+            page.frames[-1].wait_for_function("window.SeenJeemEngine && Number(document.querySelector('#hero-total-categories').textContent) > 0", timeout=120000)
             frame.locator('#btn-home-start').click(timeout=30000)
             frame.locator('[data-cat-id="arab_capitals"]').wait_for(timeout=30000)
             for cid in ['arab_capitals','kw_landmarks']:
@@ -79,32 +108,54 @@ def main():
               };
             }''',target)
             ids=game.locator('.cat-card').evaluate_all("els => els.map(e=>e.dataset.catId)")
-            chosen=['arab_capitals','kw_landmarks']+[x for x in ids if x not in ('arab_capitals','kw_landmarks')][:4]
+            chosen=[category]+[x for x in ids if x != category][:5]
             for cid in chosen:
-                frame.locator(f'[data-cat-id="{cid}"]').click()
+                category_card=frame.locator(f'[data-cat-id="{cid}"]')
+                # Cards support keyboard activation; avoid sticky mobile overlays.
+                category_card.focus()
+                category_card.press('Enter')
             frame.locator('#btn-proceed-setup').click()
             frame.locator('#btn-launch-match').click()
             frame.locator('#trivia-board-grid .board-cell-btn').first.wait_for(timeout=30000)
             cell=game.evaluate("id => Object.entries(window.__qaMatch.questionsByCell).find(([k,q])=>q.id===id)?.[0]",target)
             assert cell, f'{target} not selected'
-            frame.locator(f'[data-cell-id="{cell}"]').click()
+            target_cell=frame.locator(f'[data-cell-id="{cell}"]')
+            target_cell.evaluate("el => el.scrollIntoView({block:'center', inline:'center'})")
+            target_cell.click()
             img=frame.locator('#q-modal-visual-img')
             img.wait_for(state='visible',timeout=30000)
             img.evaluate("e => new Promise((resolve,reject)=> { if(e.complete && e.naturalWidth) return resolve(); e.addEventListener('load',resolve,{once:true}); e.addEventListener('error',reject,{once:true}); setTimeout(()=>reject(Error('image timeout')),30000) })")
             dims=img.evaluate('e => [e.naturalWidth,e.naturalHeight]')
-            assert dims==list(size),(target,dims,size)
-            expected_hash={'arab_capitals_q12':'fcd66f6274a636590611d1cb398878812c52a959cddce047dbcb26da6ca35e79','kw_landmarks_q13':'4766fd6aeefee61f3167684754f8b6f3de0b8ee77eb0048f111d59ef671a3ade'}[target]
+            assert dims[0] > 0 and dims[1] > 0, (target, dims)
+            if size: assert dims==list(size),(target,dims,size)
+            expected_hash=hashes.get(target) or {'arab_capitals_q12':'fcd66f6274a636590611d1cb398878812c52a959cddce047dbcb26da6ca35e79','kw_landmarks_q13':'4766fd6aeefee61f3167684754f8b6f3de0b8ee77eb0048f111d59ef671a3ade'}[target]
             digest=img.evaluate('''async e => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',await (await fetch(e.src)).arrayBuffer()))).map(b=>b.toString(16).padStart(2,'0')).join('')''')
             assert digest==expected_hash, (target,digest)
             page.screenshot(path=str(screenshots / f'{target}.png'))
             results.append({'type':'question','id':target,'dimensions':dims,'screenshot':str(screenshots / f'{target}.png')})
+            print(f'PASS {target}: initial image and hash', flush=True)
+            if args.skip_reopen:
+                context.close()
+                continue
             # Close the launcher project, reopen it, and resume the same question.
             page.locator('#closeSiteBtn').click()
             page.locator('#confirmCloseSiteBtn').click()
             page.locator('#postCloseReopenBtn').click(timeout=30000)
             page.locator('#viewer').wait_for(timeout=120000)
             frame=page.frame_locator('#viewer')
-            frame.locator('#btn-resume-match').click(timeout=120000)
+            try:
+                frame.locator('#btn-resume-match').click(timeout=30000)
+            except Exception:
+                game = page.frames[-1]
+                debug = game.evaluate('''() => ({
+                  title: document.title,
+                  bodyText: document.body.innerText.slice(0, 6000),
+                  storage: Object.fromEntries(Object.keys(localStorage).map(key => [key, localStorage.getItem(key)])),
+                  sessionStorage: Object.fromEntries(Object.keys(sessionStorage).map(key => [key, sessionStorage.getItem(key)]))
+                })''')
+                (screenshots / f'{target}-resume-state.json').write_text(json.dumps(debug, ensure_ascii=False, indent=2))
+                page.screenshot(path=str(screenshots / f'{target}-resume-failure.png'))
+                raise
             try:
                 frame.locator('#btn-banner-resume-question').click(timeout=10000)
             except Exception:
@@ -116,10 +167,12 @@ def main():
             img.wait_for(state='visible',timeout=30000)
             img.evaluate("e => new Promise((resolve,reject)=> { if(e.complete && e.naturalWidth) return resolve(); e.addEventListener('load',resolve,{once:true}); e.addEventListener('error',reject,{once:true}); setTimeout(()=>reject(Error('image timeout')),30000) })")
             dims=img.evaluate('e => [e.naturalWidth,e.naturalHeight]')
-            assert dims==list(size),(target,'after reopen',dims)
+            assert dims[0] > 0 and dims[1] > 0, (target, 'after reopen', dims)
+            if size: assert dims==list(size),(target,'after reopen',dims)
             digest=img.evaluate('''async e => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',await (await fetch(e.src)).arrayBuffer()))).map(b=>b.toString(16).padStart(2,'0')).join('')''')
             assert digest==expected_hash,(target,'after reopen',digest)
             results.append({'type':'question_after_reopen','id':target,'dimensions':dims})
+            print(f'PASS {target}: image and hash after reopening', flush=True)
             context.close()
         browser.close()
     server.shutdown()
